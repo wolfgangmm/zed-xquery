@@ -2,7 +2,7 @@ id = "xquery"
 name = "XQuery"
 version = "0.0.1"
 schema_version = 1
-authors = ["Wolfgang Meier <wolfangmm@jinntec.de>"]
+authors = ["Wolfgang Meier <wolfang@jinntec.de>"]
 description = "XQuery extension"
 repository = "https://github.com/wolfgangmm/zed-xquery"
 
