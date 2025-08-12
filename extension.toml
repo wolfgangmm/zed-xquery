@@ -1,0 +1,11 @@
+id = "xquery"
+name = "XQuery"
+version = "0.0.1"
+schema_version = 1
+authors = ["Wolfgang Meier <wolfangmm@jinntec.de>"]
+description = "XQuery extension"
+repository = "https://github.com/wolfgangmm/zed-xquery"
+
+[grammars.xquery]
+repository = "https://github.com/wolfgangmm/tree-sitter-xquery"
+rev = "4ad4d4aad28375624e87378152d20947017f7f8c"

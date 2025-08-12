@@ -1,0 +1,15 @@
+name = "XQuery"
+grammar = "xquery"
+path_suffixes = ["xq", "xql", "xqm", "xquery", "xqy"]
+line_comments = ["(:", "(:~"]
+block_comment = ["(:", ":)"]
+autoclose_before = ")]}:;,.|=\n\t "
+brackets = [
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "<", end = ">", close = false, newline = false },
+]
+word_characters = ["-", "_"]
+tab_size = 2
+soft_wrap = "preferred_line_length"
