@@ -2,12 +2,14 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Response};
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
-    PublishDiagnostics,
+    PublishDiagnostics, ShowMessage,
 };
 use lsp_types::request::{GotoDefinition, HoverRequest, Request as _};
 use lsp_types::*;
@@ -92,6 +94,202 @@ fn read_workspace_config(workspace: &Path) -> Option<Settings> {
         password: server.password,
         db_path: server.root.unwrap_or_else(|| "/db".into()),
     })
+}
+
+// --- Server startup check & package installation ---
+
+const XAR_VERSION: &str = "1.1.0";
+const XAR_FILENAME: &str = "atom-editor-1.1.0.xar";
+const XAR_DOWNLOAD_URL: &str =
+    "https://raw.githubusercontent.com/wolfgangmm/existdb-langserver/master/resources/atom-editor-1.1.0.xar";
+const PACKAGE_URI: &str = "http://exist-db.org/apps/atom-editor";
+
+enum ServerStatus {
+    Ok,
+    WrongVersion(String),
+    NotInstalled,
+    Unreachable(String),
+}
+
+fn make_agent(connect_secs: u64, total_secs: u64) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(connect_secs))
+        .timeout(Duration::from_secs(total_secs))
+        .build()
+}
+
+fn auth_header(settings: &Settings) -> String {
+    format!(
+        "Basic {}",
+        BASE64.encode(format!("{}:{}", settings.user, settings.password))
+    )
+}
+
+fn run_xquery(settings: &Settings, agent: &ureq::Agent, xquery: &str) -> Result<Value, String> {
+    let url = format!("{}/rest/db", settings.uri);
+    agent
+        .get(&url)
+        .set("Authorization", &auth_header(settings))
+        .query("_query", xquery)
+        .query("_wrap", "no")
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_json()
+        .map_err(|e| e.to_string())
+}
+
+fn check_server(settings: &Settings) -> ServerStatus {
+    let agent = make_agent(5, 10);
+    let xquery = format!(
+        r#"xquery version "3.0";
+declare namespace expath="http://expath.org/ns/pkg";
+declare namespace output="http://www.w3.org/2010/xslt-xquery-serialization";
+declare option output:method "json";
+declare option output:media-type "application/json";
+if ("{pkg}" = repo:list()) then
+  let $data := repo:get-resource("{pkg}", "expath-pkg.xml")
+  let $xml  := parse-xml(util:binary-to-string($data))
+  return
+    if ($xml/expath:package/@version = "{ver}") then
+      true()
+    else
+      $xml/expath:package/@version/string()
+else
+  false()"#,
+        pkg = PACKAGE_URI,
+        ver = XAR_VERSION,
+    );
+
+    match run_xquery(settings, &agent, &xquery) {
+        Err(e) => ServerStatus::Unreachable(e),
+        Ok(Value::Bool(true)) => ServerStatus::Ok,
+        Ok(Value::String(v)) => ServerStatus::WrongVersion(v),
+        _ => ServerStatus::NotInstalled,
+    }
+}
+
+fn download_xar() -> Result<Vec<u8>, String> {
+    let agent = make_agent(10, 60);
+    let response = agent.get(XAR_DOWNLOAD_URL).call().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
+fn upload_and_install_xar(settings: &Settings, xar_bytes: &[u8]) -> Result<(), String> {
+    let agent = make_agent(10, 30);
+    let db_path = format!("/db/system/repo/{}", XAR_FILENAME);
+    let upload_url = format!("{}/rest{}", settings.uri, db_path);
+
+    agent
+        .put(&upload_url)
+        .set("Authorization", &auth_header(settings))
+        .set("Content-Type", "application/octet-stream")
+        .send_bytes(xar_bytes)
+        .map_err(|e| format!("XAR upload failed: {}", e))?;
+
+    let xquery = format!(
+        r#"xquery version "3.1";
+declare namespace expath="http://expath.org/ns/pkg";
+declare namespace output="http://www.w3.org/2010/xslt-xquery-serialization";
+declare option output:method "json";
+declare option output:media-type "application/json";
+declare variable $repo := "http://demo.exist-db.org/exist/apps/public-repo/modules/find.xql";
+declare function local:remove($pkg as xs:string) as xs:boolean {{
+  if ($pkg = repo:list()) then
+    let $u := repo:undeploy($pkg) let $r := repo:remove($pkg) return $r
+  else false()
+}};
+let $xarPath := "{path}"
+let $meta    :=
+  try {{
+    compression:unzip(
+      util:binary-doc($xarPath),
+      function($p,$t,$x){{ $p="expath-pkg.xml" }}, (),
+      function($p,$t,$d,$x){{ $d }}, ()
+    )
+  }} catch * {{ error(xs:QName("local:err"),"Failed to unpack") }}
+let $pkg     := $meta//expath:package/string(@name)
+let $_       := local:remove($pkg)
+let $_       := repo:install-and-deploy-from-db($xarPath, $repo)
+return repo:get-root()"#,
+        path = db_path,
+    );
+
+    run_xquery(settings, &agent, &xquery).map_err(|e| format!("XAR install failed: {}", e))?;
+    Ok(())
+}
+
+fn show_message(connection: &Connection, typ: MessageType, message: &str) {
+    let notif = Notification::new(
+        ShowMessage::METHOD.to_string(),
+        ShowMessageParams { typ, message: message.to_string() },
+    );
+    let _ = connection.sender.send(Message::Notification(notif));
+}
+
+/// Runs after LSP initialization: checks eXistdb reachability and whether the
+/// atom-editor support package is installed; installs it automatically if not.
+fn startup_check(connection: &Connection, settings: &Settings) {
+    match check_server(settings) {
+        ServerStatus::Ok => {
+            // All good — no notification needed.
+        }
+        ServerStatus::Unreachable(reason) => {
+            show_message(
+                connection,
+                MessageType::WARNING,
+                &format!(
+                    "XQuery: cannot reach eXistdb at {} — linting and hover will not work. ({})",
+                    settings.uri, reason
+                ),
+            );
+        }
+        ServerStatus::NotInstalled => {
+            show_message(
+                connection,
+                MessageType::INFO,
+                &format!("XQuery: installing eXistdb support package (atom-editor v{})…", XAR_VERSION),
+            );
+            install_package(connection, settings);
+        }
+        ServerStatus::WrongVersion(installed) => {
+            show_message(
+                connection,
+                MessageType::INFO,
+                &format!(
+                    "XQuery: updating eXistdb support package (installed: v{}, required: v{})…",
+                    installed, XAR_VERSION
+                ),
+            );
+            install_package(connection, settings);
+        }
+    }
+}
+
+fn install_package(connection: &Connection, settings: &Settings) {
+    match download_xar() {
+        Err(e) => show_message(
+            connection,
+            MessageType::ERROR,
+            &format!("XQuery: failed to download support package: {}", e),
+        ),
+        Ok(bytes) => match upload_and_install_xar(settings, &bytes) {
+            Ok(()) => show_message(
+                connection,
+                MessageType::INFO,
+                &format!("XQuery: eXistdb support package v{} installed successfully.", XAR_VERSION),
+            ),
+            Err(e) => show_message(
+                connection,
+                MessageType::ERROR,
+                &format!("XQuery: support package installation failed: {}", e),
+            ),
+        },
+    }
 }
 
 // --- Error message parsing ---
@@ -288,10 +486,9 @@ fn call_autocomplete(
 ) -> Option<Value> {
     let url = format!("{}/apps/atom-editor/atom-autocomplete.xql", settings.uri);
     let signature = format!("{}#{}", fn_name, arity);
-    let credentials = BASE64.encode(format!("{}:{}", settings.user, settings.password));
 
     let mut req = ureq::get(&url)
-        .set("Authorization", &format!("Basic {credentials}"))
+        .set("Authorization", &auth_header(settings))
         .query("signature", &signature)
         .query("base", base_path);
 
@@ -414,11 +611,10 @@ fn lint_document(
         (db, rel) => format!("{}/{}", db, rel),
     };
 
-    let credentials = BASE64.encode(format!("{}:{}", settings.user, settings.password));
     let result = ureq::put(&compile_url)
         .set("Content-Type", "application/octet-stream")
         .set("X-BasePath", &base_path)
-        .set("Authorization", &format!("Basic {credentials}"))
+        .set("Authorization", &auth_header(settings))
         .send_bytes(text.as_bytes());
 
     let response = match result {
@@ -683,6 +879,8 @@ fn main() {
     .unwrap();
 
     connection.initialize_finish(init_id, init_result).unwrap();
+
+    startup_check(&connection, &settings);
 
     let mut documents: HashMap<String, String> = HashMap::new();
 
