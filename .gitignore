@@ -1,1 +1,16 @@
-grammars
+grammars/
+
+# Rust/Cargo build output
+target/
+lsp-server/target/
+Cargo.lock
+lsp-server/Cargo.lock
+
+# Zed extension compiled output
+*.wasm
+
+# macOS
+.DS_Store
+
+# Editor
+.cursor/
